@@ -1,0 +1,5 @@
+train: C:\Users\daforbes\Desktop\projects\tcg_scanner\dataset\images\train\
+val: C:\Users\daforbes\Desktop\projects\tcg_scanner\dataset\images\val\
+
+nc: 2
+names: ['raw card', 'psa slab']
