@@ -1,20 +1,20 @@
+import datetime
 import os
-import time
-import requests
-from io import BytesIO
 from typing import List, Tuple, Optional
 import cv2
 import numpy as np
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
 from detector_v2 import PokemonCardScanner  # Import your scanner class
 from pkmncards_com import PkmnCardFinder
 from google_search import GoogleSearchScraper
 from scrape_tcgplayer import TcgplayerProductFetcher
+from database_layer import DatabaseFactory, CardRecord
+from database_config import (
+    get_active_db_config, 
+    CARD_SCANNER_CONFIG, 
+    APP_SETTINGS,
+    get_log_path,
+    get_export_path
+)
 
 
 class CardSearcher:
@@ -28,7 +28,9 @@ class CardSearcher:
             hash_dict_path: Path to JSON file containing card hashes
         """
         self.scanner = PokemonCardScanner(config_file, checkpoint_file, hash_dict_path)
-        self.driver = None
+        self.db = DatabaseFactory.create_from_config(get_active_db_config())
+        # Initialize your original CardSearcher
+        # Uncomment and modify when ready to integrate:
     
     def save_warped_image_temp(self, warped_image: np.ndarray, temp_path: str = "temp_card.jpg") -> str:
         """Save warped image temporarily for uploading"""
@@ -61,6 +63,16 @@ class CardSearcher:
             return card_path
             
         return None
+    
+    def _should_update_price(self, card: CardRecord) -> bool:
+        """Check if card price should be updated based on age (24 hours)"""
+        if not card.last_checked:
+            return True  # Never checked = always refresh
+        
+        hours_since_check = (datetime.datetime.now() - card.last_checked).total_seconds() / 3600
+        needs_update = hours_since_check >= 24
+        
+        return needs_update
 
     def search_card(self, 
                    image_path: str, 
@@ -70,6 +82,7 @@ class CardSearcher:
                    show_debug: bool = False,
                    headless: bool = True,
                    use_reference_image: bool = True,
+                   save_to_db: bool = True,
                    reference_cards_path: str = "downloaded_cards") -> Tuple[List[Tuple[str, int]], List[str]]:
         """
         Complete workflow: scan card and perform reverse image search
@@ -115,7 +128,7 @@ class CardSearcher:
                 print("\n⚠️ Top match is not strong enough. Please choose the correct card:")
                 for i, (card_name, distance) in enumerate(matches, 1):
                     print(f"  {i}. {card_name} (distance={distance})")
-
+                print(matches)
                 while True:
                     try:
                         choice = int(input("Enter the number of the correct card (1-N): "))
@@ -133,28 +146,58 @@ class CardSearcher:
         
         
         # Use PokemonCards.com to find title
-        best_match_name = matches[0][0]
         reference_path = self.get_reference_card_path(best_match_name, reference_cards_path)
         set, card_name = best_match_name.split("/")
         card_name = card_name.removesuffix(".jpg")
-        finder = PkmnCardFinder(set_name=set, card_img_id=card_name)
-        card_title = finder.fetch_title()
-        
-        search_tcg = GoogleSearchScraper(query=card_title, target_site="tcgplayer.com")
-        product_id = search_tcg.get_first_match()
-        product_id = product_id.split("/product/")[1].split("/")[0]
+        needs_update = False
+        print(card_name)
+        if save_to_db:
+            existing_card = self.db.get_card_by_name(card_name)
+            if existing_card:
+                # Update existing card
+                needs_update = self._should_update_price(existing_card)
 
-        fetcher = TcgplayerProductFetcher(product_id=product_id)
-        price = fetcher.print_market_price()
+            if needs_update or not existing_card:
+                finder = PkmnCardFinder(set_name=set, card_img_id=card_name)
+                card_title = finder.fetch_title()
+                
+                search_tcg = GoogleSearchScraper(query=card_title + ' tcgplayer1', target_site="tcgplayer.com")
+                product_id = search_tcg.get_first_match()
+                product_id = product_id.split("/product/")[1].split("/")[0]
+
+                fetcher = TcgplayerProductFetcher(product_id=product_id)
+                price = fetcher.print_market_price()
+                if needs_update:
+                    last_checked = datetime.datetime.now()
+                    self.db.update_card_price(existing_card.id, price, last_checked)
+                else:
+                    last_checked = datetime.datetime.now()
+                    new_card = CardRecord(
+                        card_name=card_name,
+                        image_path=os.path.abspath(reference_path),
+                        last_price=price,
+                        last_checked=last_checked
+                    )
+                    
+                    card_id = self.db.insert_card(new_card)
+
+            else:
+                price = existing_card.last_price
+                card_name = existing_card.card_name
+                last_checked = existing_card.last_checked
+
+
         return {
-            "title": card_title,
-            "price": price
+            'card_name': card_name,
+            'price': price,
+            'last_checked': last_checked
         }
+                
     
-    def __del__(self):
-        """Cleanup driver on object destruction"""
-        if self.driver:
-            self.driver.quit()
+    # def __del__(self):
+    #     """Cleanup driver on object destruction"""
+    #     if self.driver:
+    #         self.driver.quit()
 
 
 def search_pokemon_card(image_path: str,
@@ -197,10 +240,14 @@ if __name__ == "__main__":
     config_file = r'C:\Users\daforbes\Desktop\projects\models\mask\pointmask_transforms\my_config.py'
     checkpoint_file = r'C:\Users\daforbes\Desktop\projects\models\mask\pointmask_transforms\best_coco_segm_mAP_epoch_99.pth'
     hash_dict_path = r"C:\Users\daforbes\Desktop\projects\tcg_scanner\raw\card_hashes.json"
-    image_path = r"C:\Users\daforbes\Downloads\buyer-says-this-is-not-near-mint-what-grade-would-you-give-v0-msup3upd8n9f1.jpg"1
+    image_path = r"C:\Users\daforbes\Downloads\s-l1600 (1).jpg"
     
     # Create searcher instance
-    searcher = CardSearcher(config_file, checkpoint_file, hash_dict_path)
+    searcher = CardSearcher(
+            config_file=CARD_SCANNER_CONFIG['config_file'],
+            checkpoint_file=CARD_SCANNER_CONFIG['checkpoint_file'],
+            hash_dict_path=CARD_SCANNER_CONFIG['hash_dict_path']
+        )
     
     # Perform complete search using reference card image
     result = searcher.search_card(
